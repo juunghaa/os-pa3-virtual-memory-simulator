@@ -116,13 +116,14 @@ int pop_queue(struct queue *q) {
 }
 
 int init_mem() {
-    // Frame access time 초기화
-    for(int i=0; i<PF_NUM; i++) frame_last_access[i] = 0;
+    for(int i = 0; i < PF_NUM; i++) frame_last_access[i] = 0;
 
-	if (init_queue(&free_pfns, PF_NUM) == -1) return -1;
-	for (uint8_t i = 0; i < PF_NUM; i++) {
-		if (push_queue(free_pfns, i) == -1)	return -1;
-	}	
+    if (init_queue(&free_pfns, PF_NUM) == -1) return -1;
+    
+    // Frame 0x000, 0x001은 비트마스크 전용 → free queue에서 제외
+    for (uint8_t i = 2; i < PF_NUM; i++) {  // ✅ 2부터 시작
+        if (push_queue(free_pfns, i) == -1) return -1;
+    }	
     return 0;
 }
 void dealloc_mem() { dealloc_queue(free_pfns); }

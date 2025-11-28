@@ -85,7 +85,7 @@ int main(int argc, char *argv[])
         
         // 주소 변환 요청
         uint16_t pa = translate_va_to_pa(va, offset_bits);
-        log_pa_result(pa);
+        // log_pa_result(pa);
     }
 
     fclose(fp);

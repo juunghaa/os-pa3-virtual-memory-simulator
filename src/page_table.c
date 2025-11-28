@@ -47,41 +47,33 @@ uint64_t is_swapable(uint8_t pfn)
 
 /**
  * invalidate_page - 특정 PFN을 가리키는 PTE를 찾아 무효화 (Recursive)
- * Swap Out 발생 시 Page Table 내용을 갱신하기 위함
+ * 
+ * 3-Level Paging 구조:
+ *   lvl 0: Root Page Directory
+ *   lvl 1: Middle Page Table
+ *   lvl 2: Leaf Page Table (여기서 데이터 프레임을 가리킴)
  */
 int invalidate_page(struct PageTable* pt, uint8_t pfn, int lvl)
 {
-	for (int i = 0; i < PTE_NUM; ++i) { // PTE_NUM = 8
-		struct pte* entry = &pt->pte[i];
-		
-		// 해당 엔트리가 유효하지 않으면 스킵
-		if (!entry->present) continue;
-
-		// Leaf Node (Level 3) 이고, PFN이 일치하면 무효화
-		if (lvl == 3) { // 0, 1, 2가 인덱스이므로 3번째 레벨은 없습니다. 로직 수정 필요
-            // 수정: 3-level paging에서 lvl 변수는 0(Root), 1(Middle), 2(Leaf)로 봅니다.
-            // 하지만 이 함수는 재귀적으로 호출되므로, 
-            // 현재 entry가 가리키는 것이 target PFN인지(데이터 페이지), 
-            // 아니면 다음 테이블인지 확인해야 합니다.
-            // 여기서는 단순화를 위해 Leaf Level(lvl==2)일 때만 PFN 비교를 수행합니다.
-        }
-
-        // 3-Level Paging 구조: Root(L1) -> Middle(L2) -> Leaf(L3) -> Data
-        // 함수 인자 lvl: 현재 테이블의 레벨 (0, 1, 2)
+    for (int i = 0; i < PTE_NUM; ++i) {
+        struct pte* entry = &pt->pte[i];
         
-        if (lvl == 2) { // 현재가 L3 테이블(Leaf)일 때
+        if (!entry->present) continue;
+
+        if (lvl == 2) {
+            // Leaf Level: entry->pfn이 데이터 프레임을 가리킴
             if (entry->pfn == pfn) {
-                entry->present = 0; // 무효화
-                return 1; // 찾았음
+                entry->present = 0;
+                return 1;  // 찾아서 무효화 완료
             }
         } else {
-            // 아직 Leaf가 아니면 재귀 호출
+            // Non-Leaf: 다음 레벨 테이블로 재귀
             struct PageTable* next_pt = (struct PageTable*)&RAM[entry->pfn];
             if (invalidate_page(next_pt, pfn, lvl + 1))
                 return 1;
         }
-	}
-	return 0;
+    }
+    return 0;  // 이 서브트리에서 못 찾음
 }
 
 /**
@@ -173,14 +165,16 @@ int get_frame()
  */
 void init_swapable_bitmap()
 {
-	for (int i = 0; i < 2; i++) {
-		int pfn = get_frame(); // 비트마스크 자체도 메모리에 저장됨
-		swapable_bitmask[i] = &RAM[pfn];
-		*swapable_bitmask[i] = -1; // 초기값: 모든 비트 1
-        
-        // 비트마스크 저장 공간 자체는 swap 불가능
-		set_swapable(pfn, 0); 
-	}
+    // Frame 0x000, 0x001은 비트마스크 전용으로 고정
+    swapable_bitmask[0] = &RAM[0];  // Frame 0x000 = lower 64-bit
+    swapable_bitmask[1] = &RAM[1];  // Frame 0x001 = upper 64-bit
+    
+    // 초기값: 모든 비트 0 (모든 프레임 swap 불가 상태로 시작)
+    // 데이터 페이지 할당 시에만 해당 비트를 1로 설정함
+    RAM[0] = 0;
+    RAM[1] = 0;
+    
+    // 비트마스크 프레임(0, 1)은 이미 bit=0이므로 별도 설정 불필요
 }
 
 /**
@@ -303,59 +297,58 @@ uint8_t load_page(uint16_t vpn)
  * translate_va_to_pa - 가상 주소를 물리 주소로 변환 (핵심 로직)
  */
 uint16_t translate_va_to_pa(uint16_t va, int offset_bits) {
-	log_va_access(va);
+    log_va_access(va);
     
-    // 주소 비트 분리
-	uint16_t offset = va & ((1 << offset_bits) - 1); // Lower 3 bits
-	uint16_t vpn = (va >> offset_bits) & 0x1FF;      // Upper 9 bits
+    uint16_t offset = va & ((1 << offset_bits) - 1);
+    uint16_t vpn = (va >> offset_bits) & 0x1FF;
 
-	uint8_t pfn;
+    uint8_t pfn;
 
-    // 1. TLB 검색
-	if (search_tlb(vpn, &pfn)) {
-		log_tlb_hit(vpn, pfn);
+    // 1. TLB Hit → 바로 반환
+    if (search_tlb(vpn, &pfn)) {
+        log_tlb_hit(vpn, pfn);
         
-        // [LRU] 데이터 프레임 접근 시간 갱신
-        if(current_policy == POLICY_LRU) frame_last_access[pfn] = global_tick;
+        if (current_policy == POLICY_LRU) 
+            frame_last_access[pfn] = global_tick;
         
-		return (pfn << offset_bits) | offset;
-	}
-	log_tlb_miss(vpn);
+        log_pa_result((pfn << offset_bits) | offset);
+        return (pfn << offset_bits) | offset;
+    }
+    log_tlb_miss(vpn);
 
-    // 2. Page Table 검색
-	int pt_hit = page_table_lookup(vpn, &pfn);
-	if (pt_hit) {
-        // PT Hit (메모리엔 있지만 TLB에 없음)
-		log_pt_hit(vpn, pfn); // 예시 로그에 PT Hit는 생략되어 있어 주석 처리
-
-        // TLB 업데이트
-		update_tlb(vpn, pfn);
-		log_tlb_update(vpn, pfn);
+    // 2. PT Hit (TLB Miss) → TLB 업데이트 후 재접근
+    if (page_table_lookup(vpn, &pfn)) {
+        log_pt_hit(vpn, pfn);  // 예제 출력에 없으므로 주석 처리
         
-        // [LRU] 데이터 프레임 접근 시간 갱신
-        if(current_policy == POLICY_LRU) frame_last_access[pfn] = global_tick;
+        update_tlb(vpn, pfn);
+        log_tlb_update(vpn, pfn);
         
-        // 예시 출력 포맷: Access -> Hit -> PA
+        if (current_policy == POLICY_LRU) 
+            frame_last_access[pfn] = global_tick;
+        
+        // ✅ 재접근 로그 추가
         log_va_access(va);
         log_tlb_hit(vpn, pfn);
+        
+        log_pa_result((pfn << offset_bits) | offset);
+        return (pfn << offset_bits) | offset;
+    }
+    log_pt_miss(vpn);
 
-		return (pfn << offset_bits) | offset;
-	}
-	log_pt_miss(vpn);
-
-    // 3. Page Fault (메모리에도 없음) -> Load from Disk
-	pfn = load_page(vpn);
+    // 3. Page Fault → 페이지 로드 후 재접근
+    pfn = load_page(vpn);
     
-    // [LRU] 새 프레임 접근 시간 갱신
-    if(current_policy == POLICY_LRU) frame_last_access[pfn] = global_tick;
+    if (current_policy == POLICY_LRU) 
+        frame_last_access[pfn] = global_tick;
 
-	log_pt_update(vpn, pfn);
-	update_tlb(vpn, pfn);
-	log_tlb_update(vpn, pfn);
+    log_pt_update(vpn, pfn);
+    update_tlb(vpn, pfn);
+    log_tlb_update(vpn, pfn);
 
-    // 4. Retry (Simulation of Access Again)
+    // ✅ 재접근 로그 추가
     log_va_access(va);
     log_tlb_hit(vpn, pfn);
 
-	return (pfn << offset_bits) | offset;
+    log_pa_result((pfn << offset_bits) | offset);
+    return (pfn << offset_bits) | offset;
 }
